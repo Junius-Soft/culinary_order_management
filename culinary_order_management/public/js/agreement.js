@@ -84,6 +84,12 @@ frappe.ui.form.on('Agreement', {
     },
     
     before_submit: function(frm) {
+        // Global flag - hook'un sadece bir kez çalışmasını sağla
+        if (frm._agreement_before_submit_in_progress) {
+            return Promise.resolve();
+        }
+        frm._agreement_before_submit_in_progress = true;
+        
         // Önce customer notes modal'ını aç
         return new Promise((resolve, reject) => {
             // Popup'ın sadece bir kez gösterilmesini sağlamak için flag
@@ -153,12 +159,14 @@ frappe.ui.form.on('Agreement', {
                                                 message: r.message || __('Operation failed')
                                             });
                                         }
-                                    });
-                                    // Submit işlemini durdur (replace_agreement içinde zaten submit ediliyor)
-                                    reject();
-                                },
+                                            });
+                                            // Submit işlemini durdur (replace_agreement içinde zaten submit ediliyor)
+                                            frm._agreement_before_submit_in_progress = false;
+                                            reject();
+                                        },
                                 () => {
                                     // Hayır - submit işlemini iptal et
+                                    frm._agreement_before_submit_in_progress = false;
                                     frappe.show_alert({
                                         message: __('Agreement remained as draft'),
                                         indicator: 'orange'
@@ -168,11 +176,13 @@ frappe.ui.form.on('Agreement', {
                             );
                         } else {
                             // Aktif anlaşma yok - normal submit devam etsin
+                            frm._agreement_before_submit_in_progress = false;
                             resolve();
                         }
                     },
                     error: function() {
                         checkInProgress = false;
+                        frm._agreement_before_submit_in_progress = false;
                         reject();
                     }
                 });
