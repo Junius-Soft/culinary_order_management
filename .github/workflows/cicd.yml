@@ -82,3 +82,11 @@ jobs:
           curl -X POST -H 'Content-type: application/json' \
           --data "{\"text\":\":x: Build FAILED on *${{ github.ref_name }}*\"}" \
           ${{ secrets.SLACK_WEBHOOK }}
+
+    - name: Upload logs
+      if: always()
+      run: |
+          LOG=$(cat build.log)
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"\`\`\`${LOG}\`\`\`\"}" \
+          ${{ secrets.SLACK_WEBHOOK }}
