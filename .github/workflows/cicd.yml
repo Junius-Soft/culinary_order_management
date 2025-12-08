@@ -49,7 +49,9 @@ jobs:
           
           echo "Restarting services..."
           sudo supervisorctl restart all
-          
+          sudo supervisorctl status
+          } 2>&1 | tee /home/ubuntu/deploy.log
+
           sleep 5
           
           echo ""
@@ -83,10 +85,11 @@ jobs:
           --data "{\"text\":\":x: Build FAILED on *${{ github.ref_name }}*\"}" \
           ${{ secrets.SLACK_WEBHOOK }}
 
-    - name: Upload logs
+    - name: Upload full log file to Slack
       if: always()
       run: |
-          LOG=$(cat build.log)
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\"\`\`\`${LOG}\`\`\`\"}" \
-          ${{ secrets.SLACK_WEBHOOK }}
+        curl -F file=@deploy.log \
+           -F "initial_comment=Deployment Log" \
+           -F channels=your-slack-channel-id \
+           -H "Authorization: Bearer ${{ secrets.SLACK_TOKEN }}" \
+           https://slack.com/api/files.upload
