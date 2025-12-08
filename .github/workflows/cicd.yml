@@ -67,3 +67,18 @@ jobs:
             sudo supervisorctl status | grep "BACKOFF\|FATAL"
           fi
 
+
+
+    - name: Notify Slack on success
+      if: success()
+      run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\":white_check_mark: Build & Deploy Success on *${{ github.ref_name }}*\"}" \
+          ${{ secrets.SLACK_WEBHOOK }}
+
+    - name: Notify Slack on failure
+      if: failure()
+      run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\":x: Build FAILED on *${{ github.ref_name }}*\"}" \
+          ${{ secrets.SLACK_WEBHOOK }}
