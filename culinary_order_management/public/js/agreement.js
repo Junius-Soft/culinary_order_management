@@ -212,13 +212,6 @@ frappe.ui.form.on('Agreement', {
                     // Modal kapandıktan sonra mevcut aktif anlaşma kontrolünü yap
                     checkActiveAgreement();
                 },
-                secondary_action_label: __('Continue (Don\'t Add Note)'),
-                secondary_action: function() {
-                    // Not eklenmeden devam et, mevcut aktif anlaşma kontrolünü yap
-                    dialog.hide();
-                    
-                    checkActiveAgreement();
-                }
             });
             
             dialog.show();

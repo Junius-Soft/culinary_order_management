@@ -5,6 +5,17 @@ frappe.listview_settings['Agreement'] = {
 	has_indicator_for_draft: 1,
 	has_indicator_for_cancelled: 1,
 	
+	onload: function(list_view) {
+		// Actions dropdown açıldığında Submit butonunu Activate olarak değiştir
+		$(document).on('shown.bs.dropdown', function(e) {
+			$(e.target).find('.dropdown-menu a').each(function() {
+				if ($(this).text().trim() === __('Submit')) {
+					$(this).text(__('Activate'));
+				}
+			});
+		});
+	},
+	
 	get_indicator: function(doc) {
 		// Tarih bazlı durum göstergesi - Frappe standart renkleri
 		const status_colors = {
