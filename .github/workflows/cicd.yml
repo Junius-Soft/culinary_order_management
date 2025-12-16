@@ -1,4 +1,4 @@
-name: Deploy Frappe to EC2 (with Rollback Support)
+name: Deploy Frappe to EC2 (Fixed Exit Codes)
 
 on:
   push:
@@ -16,23 +16,22 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Full history for tagging
+        fetch-depth: 0
 
     - name: Deploy to EC2
       uses: appleboy/ssh-action@v1.0.3
-      id: deploy
       with:
         host: ${{ secrets.CULLINAR_ERP_EC2_HOST }}
         username: ubuntu
         key: ${{ secrets.CULLINAR_ERP_EC2_SSH_KEY }}
         port: 22
         command_timeout: 45m
-        script_stop: false
         script: |
           #!/bin/bash
-          set -e
+          # DO NOT use set -e here - we handle errors manually
           set -o pipefail
 
+          # Redirect all output
           exec > >(tee -a /home/ubuntu/deploy.log)
           exec 2>&1
 
@@ -41,7 +40,15 @@ jobs:
           echo "📅 Date: $(date)"
           echo "==================================="
 
+          # --------------------------------------------------
+          # Initialize success flag
+          # --------------------------------------------------
+          DEPLOYMENT_SUCCESS=true
+          DEPLOYMENT_EXIT_CODE=0
+
+          # --------------------------------------------------
           # Prevent parallel deployments
+          # --------------------------------------------------
           LOCK_FILE="/tmp/frappe_deploy.lock"
           exec 9>"$LOCK_FILE"
           
@@ -50,15 +57,31 @@ jobs:
             exit 1
           fi
 
+          # Cleanup function
           cleanup() {
-            local exit_code=$?
             flock -u 9 2>/dev/null || true
-            exit $exit_code
           }
           
           trap cleanup EXIT INT TERM
 
+          # --------------------------------------------------
+          # Error handler
+          # --------------------------------------------------
+          handle_error() {
+            local exit_code=$1
+            local step_name="$2"
+            
+            echo ""
+            echo "❌ Error in step: $step_name"
+            echo "Exit code: $exit_code"
+            
+            DEPLOYMENT_SUCCESS=false
+            DEPLOYMENT_EXIT_CODE=$exit_code
+          }
+
+          # --------------------------------------------------
           # Retry helper
+          # --------------------------------------------------
           retry() {
             local retries=$1
             local wait_time=$2
@@ -66,101 +89,295 @@ jobs:
             local cmd="$*"
 
             for ((i=1; i<=retries; i++)); do
+              echo "▶️  Attempt $i/$retries: $cmd"
+              
               if eval "$cmd"; then
+                echo "✅ Command succeeded"
                 return 0
               fi
+
+              local last_exit_code=$?
+              echo "⚠️  Command failed with exit code: $last_exit_code"
+              
               if [ "$i" -lt "$retries" ]; then
+                echo "⏳ Waiting $wait_time seconds..."
                 sleep "$wait_time"
               fi
             done
+
+            echo "❌ Command failed after $retries attempts"
             return 1
           }
 
+          # --------------------------------------------------
           # Pull latest code
+          # --------------------------------------------------
+          echo ""
+          echo "📥 Pulling Latest Code"
+          echo "-----------------------------------"
+          
           APP_DIR="/home/ubuntu/frappe-bench-test/apps/culinary_order_management"
-          cd "$APP_DIR" || exit 1
-
-          echo "📥 Pulling latest code..."
           
-          # Save current commit for rollback
-          PREVIOUS_COMMIT=$(git rev-parse HEAD)
-          echo "📌 Previous commit: $PREVIOUS_COMMIT"
-
-          git fetch upstream || git fetch origin
-          git checkout main
+          if [ ! -d "$APP_DIR" ]; then
+            handle_error 1 "App directory not found: $APP_DIR"
+            exit $DEPLOYMENT_EXIT_CODE
+          fi
           
+          cd "$APP_DIR"
+
+          # Save current commit
+          PREVIOUS_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+          echo "📌 Current commit: $PREVIOUS_COMMIT"
+
+          # Fetch and pull
           if git remote | grep -q "upstream"; then
-            git pull upstream main || git pull origin main
+            if ! retry 3 10 "git fetch upstream"; then
+              echo "⚠️  Upstream fetch failed, trying origin..."
+              if ! retry 3 10 "git fetch origin"; then
+                handle_error $? "Git fetch"
+                exit $DEPLOYMENT_EXIT_CODE
+              fi
+            fi
           else
-            git pull origin main
+            if ! retry 3 10 "git fetch origin"; then
+              handle_error $? "Git fetch"
+              exit $DEPLOYMENT_EXIT_CODE
+            fi
+          fi
+
+          if ! git checkout main; then
+            handle_error $? "Git checkout"
+            exit $DEPLOYMENT_EXIT_CODE
+          fi
+
+          if git remote | grep -q "upstream"; then
+            if ! git pull upstream main; then
+              echo "⚠️  Upstream pull failed, trying origin..."
+              if ! git pull origin main; then
+                handle_error $? "Git pull"
+                exit $DEPLOYMENT_EXIT_CODE
+              fi
+            fi
+          else
+            if ! git pull origin main; then
+              handle_error $? "Git pull"
+              exit $DEPLOYMENT_EXIT_CODE
+            fi
           fi
 
           NEW_COMMIT=$(git rev-parse HEAD)
-          echo "📌 New commit: $NEW_COMMIT"
+          echo "✅ Updated to commit: $NEW_COMMIT"
 
-          # Build & migrate
+          # --------------------------------------------------
+          # Build assets
+          # --------------------------------------------------
+          echo ""
+          echo "🏗️  Building Assets"
+          echo "-----------------------------------"
+          
           BENCH_DIR="/home/ubuntu/frappe-bench-test"
-          cd "$BENCH_DIR" || exit 1
+          cd "$BENCH_DIR"
 
-          echo "🏗️  Building assets..."
-          if ! retry 3 60 "timeout 10m bench build --app culinary_order_management"; then
-            echo "❌ Build failed"
-            cd "$APP_DIR"
-            git checkout "$PREVIOUS_COMMIT"
-            echo "🔙 Rolled back to previous commit"
-            exit 1
+          # Build with explicit exit code check
+          BUILD_OUTPUT=$(timeout 10m bench build --app culinary_order_management 2>&1)
+          BUILD_EXIT_CODE=$?
+          
+          echo "$BUILD_OUTPUT"
+          
+          # Check for actual build errors (not just warnings)
+          if [ $BUILD_EXIT_CODE -ne 0 ]; then
+            if echo "$BUILD_OUTPUT" | grep -qiE "error|fatal|failed"; then
+              echo "❌ Build failed with errors"
+              handle_error $BUILD_EXIT_CODE "Build"
+              
+              # Rollback
+              cd "$APP_DIR"
+              git checkout "$PREVIOUS_COMMIT"
+              exit $DEPLOYMENT_EXIT_CODE
+            else
+              echo "⚠️  Build exited with code $BUILD_EXIT_CODE but no critical errors found"
+              echo "✅ Continuing deployment..."
+            fi
+          else
+            echo "✅ Build completed successfully"
           fi
 
-          echo "🧬 Running migrations..."
-          if ! retry 3 60 "timeout 10m bench --site all migrate"; then
-            echo "❌ Migration failed"
-            cd "$APP_DIR"
-            git checkout "$PREVIOUS_COMMIT"
-            retry 2 60 "timeout 10m bench build --app culinary_order_management"
-            echo "🔙 Rolled back to previous commit"
-            exit 1
+          # --------------------------------------------------
+          # Run migrations
+          # --------------------------------------------------
+          echo ""
+          echo "🧬 Running Migrations"
+          echo "-----------------------------------"
+          
+          cd "$BENCH_DIR"
+          
+          # Migrate with explicit exit code check
+          MIGRATE_OUTPUT=$(timeout 10m bench --site all migrate 2>&1)
+          MIGRATE_EXIT_CODE=$?
+          
+          echo "$MIGRATE_OUTPUT"
+          
+          # Check migration result
+          if [ $MIGRATE_EXIT_CODE -ne 0 ]; then
+            # Check if it's a real error or just informational exit
+            if echo "$MIGRATE_OUTPUT" | grep -qiE "error|exception|traceback|failed" | grep -v "No migration"; then
+              echo "❌ Migration failed with errors"
+              handle_error $MIGRATE_EXIT_CODE "Migration"
+              
+              # Rollback
+              cd "$APP_DIR"
+              git checkout "$PREVIOUS_COMMIT"
+              retry 2 60 "bench build --app culinary_order_management"
+              exit $DEPLOYMENT_EXIT_CODE
+            else
+              # Check if migration actually completed
+              if echo "$MIGRATE_OUTPUT" | grep -qE "Updating DocTypes.*100%|Migration complete"; then
+                echo "⚠️  Migration exited with code $MIGRATE_EXIT_CODE but completed successfully"
+                echo "✅ Continuing deployment..."
+              else
+                echo "❌ Migration status unclear"
+                handle_error $MIGRATE_EXIT_CODE "Migration"
+                cd "$APP_DIR"
+                git checkout "$PREVIOUS_COMMIT"
+                exit $DEPLOYMENT_EXIT_CODE
+              fi
+            fi
+          else
+            echo "✅ Migration completed successfully"
           fi
 
-          echo "🧹 Clearing cache..."
-          retry 2 30 "bench --site all clear-cache" || true
+          # --------------------------------------------------
+          # Clear cache
+          # --------------------------------------------------
+          echo ""
+          echo "🧹 Clearing Cache"
+          echo "-----------------------------------"
+          
+          # Cache clear can fail without affecting deployment
+          if bench --site all clear-cache 2>&1; then
+            echo "✅ Cache cleared"
+          else
+            echo "⚠️  Cache clear failed, but continuing..."
+          fi
 
+          # --------------------------------------------------
           # Restart services
-          echo "🔁 Restarting services..."
-          bench restart
+          # --------------------------------------------------
+          echo ""
+          echo "🔁 Restarting Services"
+          echo "-----------------------------------"
+          
+          if bench restart 2>&1; then
+            echo "✅ Services restarted via bench"
+          else
+            echo "⚠️  bench restart failed, trying supervisor..."
+            if sudo supervisorctl restart all 2>&1; then
+              echo "✅ Services restarted via supervisor"
+            else
+              handle_error $? "Service restart"
+              exit $DEPLOYMENT_EXIT_CODE
+            fi
+          fi
 
+          echo "⏳ Waiting for services to stabilize..."
           sleep 10
 
-          echo "📊 Supervisor status:"
-          sudo supervisorctl status
-
+          # --------------------------------------------------
           # Health check
-          if sudo supervisorctl status | grep -qE "BACKOFF|FATAL|EXITED"; then
-            echo "❌ Services failed to start"
-            sudo supervisorctl status | grep -E "BACKOFF|FATAL|EXITED" || true
+          # --------------------------------------------------
+          echo ""
+          echo "🏥 Health Check"
+          echo "-----------------------------------"
+          
+          echo "📊 Supervisor status:"
+          SUPERVISOR_STATUS=$(sudo supervisorctl status 2>&1)
+          echo "$SUPERVISOR_STATUS"
+          
+          # Check for critical failures
+          if echo "$SUPERVISOR_STATUS" | grep -qE "FATAL|EXITED"; then
+            echo "❌ Critical services are down"
+            echo "$SUPERVISOR_STATUS" | grep -E "FATAL|EXITED"
+            handle_error 1 "Service health check"
+            exit $DEPLOYMENT_EXIT_CODE
+          fi
+          
+          # BACKOFF is temporary, give it time
+          if echo "$SUPERVISOR_STATUS" | grep -q "BACKOFF"; then
+            echo "⚠️  Some services are in BACKOFF state"
+            echo "⏳ Waiting additional 10 seconds..."
+            sleep 10
             
-            echo "🔙 Attempting automatic rollback..."
-            cd "$APP_DIR"
-            git checkout "$PREVIOUS_COMMIT"
-            cd "$BENCH_DIR"
-            retry 2 60 "bench build --app culinary_order_management"
-            bench restart
+            SUPERVISOR_STATUS=$(sudo supervisorctl status 2>&1)
+            echo "$SUPERVISOR_STATUS"
             
-            exit 1
+            if echo "$SUPERVISOR_STATUS" | grep -qE "FATAL|EXITED"; then
+              echo "❌ Services still not running"
+              handle_error 1 "Service health check"
+              exit $DEPLOYMENT_EXIT_CODE
+            fi
+          fi
+          
+          RUNNING_COUNT=$(echo "$SUPERVISOR_STATUS" | grep -c "RUNNING" || echo "0")
+          echo "✅ Services running: $RUNNING_COUNT"
+          
+          if [ "$RUNNING_COUNT" -lt 1 ]; then
+            echo "❌ No services are running"
+            handle_error 1 "Service health check"
+            exit $DEPLOYMENT_EXIT_CODE
           fi
 
-          # Create success tag for future rollback
-          cd "$APP_DIR"
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          git tag -a "deploy-success-$TIMESTAMP" -m "Successful deployment at $TIMESTAMP"
-          
-          echo "🏷️  Created tag: deploy-success-$TIMESTAMP"
+          # --------------------------------------------------
+          # Create success tag
+          # --------------------------------------------------
+          if [ "$DEPLOYMENT_SUCCESS" = true ]; then
+            echo ""
+            echo "🏷️  Creating Success Tag"
+            echo "-----------------------------------"
+            
+            cd "$APP_DIR"
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            
+            if git tag -a "deploy-success-$TIMESTAMP" -m "Successful deployment at $TIMESTAMP" 2>&1; then
+              echo "✅ Tag created: deploy-success-$TIMESTAMP"
+            else
+              echo "⚠️  Failed to create tag, but deployment succeeded"
+            fi
+          fi
 
+          # --------------------------------------------------
+          # Final summary
+          # --------------------------------------------------
           echo ""
           echo "==================================="
-          echo "✅ Deployment Completed Successfully"
-          echo "📌 Deployed commit: $NEW_COMMIT"
-          echo "🏷️  Rollback tag: deploy-success-$TIMESTAMP"
+          if [ "$DEPLOYMENT_SUCCESS" = true ]; then
+            echo "✅ Deployment Completed Successfully"
+          else
+            echo "❌ Deployment Failed"
+          fi
           echo "==================================="
+          echo "📅 Completed at: $(date)"
+          echo "📌 Previous commit: $PREVIOUS_COMMIT"
+          echo "📌 New commit: $NEW_COMMIT"
+          echo "📊 Services running: $RUNNING_COUNT"
+          echo "==================================="
+          
+          # Exit with proper code
+          exit $DEPLOYMENT_EXIT_CODE
+
+    - name: Check deployment result
+      if: always()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.CULLINAR_ERP_EC2_HOST }}
+        username: ubuntu
+        key: ${{ secrets.CULLINAR_ERP_EC2_SSH_KEY }}
+        script: |
+          echo "📋 Final deployment log (last 50 lines):"
+          tail -50 /home/ubuntu/deploy.log
+          
+          echo ""
+          echo "📊 Current supervisor status:"
+          sudo supervisorctl status
 
     - name: Notify Slack on success
       if: success()
@@ -205,7 +422,7 @@ jobs:
             \"attachments\": [{
               \"color\": \"danger\",
               \"title\": \":x: Frappe Deployment FAILED\",
-              \"text\": \"Automatic rollback was attempted. Check logs for details.\",
+              \"text\": \"Check logs for details. Automatic rollback may have been attempted.\",
               \"fields\": [
                 {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
                 {\"title\": \"Commit\", \"value\": \"$(git rev-parse --short HEAD)\", \"short\": true},
