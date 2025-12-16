@@ -10,11 +10,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Deploy to EC2
       uses: appleboy/ssh-action@v1.0.3
       with:
@@ -22,74 +22,92 @@ jobs:
         username: ubuntu
         key: ${{ secrets.CULLINAR_ERP_EC2_SSH_KEY }}
         command_timeout: 30m
+        envs: SLACK_TOKEN
         script: |
+          (
+          set -e
+
           echo "==================================="
-          echo "Starting Frappe Deployment"
+          echo "🚀 Starting Frappe Deployment"
           echo "==================================="
-          
-          # Pull latest code
+
+          # --------------------------------------------------
+          # Prevent parallel deployments
+          # --------------------------------------------------
+          exec 9>/tmp/frappe_deploy.lock
+          flock -n 9 || {
+            echo "❌ Another deployment is running. Exiting."
+            exit 1
+          }
+
+          # --------------------------------------------------
+          # Go to app directory & pull latest code
+          # --------------------------------------------------
           cd /home/ubuntu/frappe-bench-test/apps/culinary_order_management
-          git pull upstream main
-          
-          # Build and migrate
+
+          echo "📥 Fetching latest code..."
+          git fetch origin
+          git checkout main
+          git pull origin main
+
+          # --------------------------------------------------
+          # Build & migrate
+          # --------------------------------------------------
           cd /home/ubuntu/frappe-bench-test
-          
-          echo "Building assets..."
+
+          echo "🏗️  Building assets..."
           bench build --app culinary_order_management
-          
-          echo "Running migrations..."
-          # Try migration with skip-failing first
-          if ! bench migrate --skip-failing; then
-            echo "⚠️  Migration had some failures, but continuing..."
-            echo "Check logs for details after deployment"
-          fi
-          
-          echo "Clearing cache..."
+
+          echo "🧬 Running migrations..."
+          bench migrate
+
+          echo "🧹 Clearing cache..."
           bench --site all clear-cache
-          
-          echo "Restarting services..."
-          sudo supervisorctl restart all
-          sudo supervisorctl status
-          } 2>&1 | tee /home/ubuntu/deploy.log
 
-          sleep 5
-          
+          # --------------------------------------------------
+          # Restart services
+          # --------------------------------------------------
+          echo "🔁 Restarting Frappe services..."
+          bench restart
+
           echo ""
-          echo "Service status:"
+          echo "📊 Supervisor status:"
           sudo supervisorctl status
-          
-          echo ""
+
           echo "==================================="
-          echo "Deployment completed!"
+          echo "✅ Deployment completed successfully"
           echo "==================================="
-          
-          # Check if services are actually running
+          ) 2>&1 | tee /home/ubuntu/deploy.log
+
+          # --------------------------------------------------
+          # Health check
+          # --------------------------------------------------
+          sleep 5
           if sudo supervisorctl status | grep -q "BACKOFF\|FATAL"; then
-            echo "⚠️  Warning: Some services failed to start"
+            echo "⚠️  Some services failed to start"
             sudo supervisorctl status | grep "BACKOFF\|FATAL"
+            exit 1
           fi
 
-
+          # --------------------------------------------------
+          # Upload deploy log to Slack
+          # --------------------------------------------------
+          curl -F file=@/home/ubuntu/deploy.log \
+            -F "initial_comment=📄 Frappe Deployment Log" \
+            -F channels=your-slack-channel-id \
+            -H "Authorization: Bearer $SLACK_TOKEN" \
+            https://slack.com/api/files.upload
 
     - name: Notify Slack on success
       if: success()
       run: |
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\":white_check_mark: Build & Deploy Success on *${{ github.ref_name }}*\"}" \
-          ${{ secrets.SLACK_WEBHOOK }}
+        curl -X POST -H 'Content-type: application/json' \
+        --data "{\"text\":\":white_check_mark: *Frappe Deploy SUCCESS* on *${{ github.ref_name }}*\"}" \
+        ${{ secrets.SLACK_WEBHOOK }}
 
     - name: Notify Slack on failure
       if: failure()
       run: |
-          curl -X POST -H 'Content-type: application/json' \
-          --data "{\"text\":\":x: Build FAILED on *${{ github.ref_name }}*\"}" \
-          ${{ secrets.SLACK_WEBHOOK }}
-
-    - name: Upload full log file to Slack
-      if: always()
-      run: |
-        curl -F file=@deploy.log \
-           -F "initial_comment=Deployment Log" \
-           -F channels=your-slack-channel-id \
-           -H "Authorization: Bearer ${{ secrets.SLACK_TOKEN }}" \
-           https://slack.com/api/files.upload
+        curl -X POST -H 'Content-type: application/json' \
+        --data "{\"text\":\":x: *Frappe Deploy FAILED* on *${{ github.ref_name }}*\"}" \
+        ${{ secrets.SLACK_WEBHOOK }}
