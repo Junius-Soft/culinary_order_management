@@ -10,6 +10,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 60  # Global timeout
 
     steps:
     - name: Checkout code
@@ -21,41 +22,96 @@ jobs:
         host: ${{ secrets.CULLINAR_ERP_EC2_HOST }}
         username: ubuntu
         key: ${{ secrets.CULLINAR_ERP_EC2_SSH_KEY }}
+        port: 22
         command_timeout: 45m
-        envs: SLACK_TOKEN
+        script_stop: false  # Continue on error to capture logs
         script: |
-          (
+          #!/bin/bash
           set -e
+          set -o pipefail
+
+          # Redirect all output to both console and log file
+          exec > >(tee -a /home/ubuntu/deploy.log)
+          exec 2>&1
 
           echo "==================================="
           echo "🚀 Starting Frappe Deployment"
+          echo "📅 Date: $(date)"
+          echo "👤 User: $(whoami)"
           echo "==================================="
+
+          # --------------------------------------------------
+          # Environment check
+          # --------------------------------------------------
+          echo ""
+          echo "🔍 Environment Check:"
+          echo "-----------------------------------"
+          echo "Working directory: $(pwd)"
+          echo "Python version: $(python3 --version 2>&1 || echo 'Python not found')"
+          echo "Node version: $(node --version 2>&1 || echo 'Node not found')"
+          echo "Bench version: $(bench --version 2>&1 || echo 'Bench not found')"
+          
+          # Check if bench directory exists
+          if [ ! -d "/home/ubuntu/frappe-bench-test" ]; then
+            echo "❌ ERROR: Frappe bench directory not found!"
+            exit 1
+          fi
 
           # --------------------------------------------------
           # Prevent parallel deployments
           # --------------------------------------------------
-          exec 9>/tmp/frappe_deploy.lock
-          flock -n 9 || {
-            echo "❌ Another deployment is running. Exiting."
+          LOCK_FILE="/tmp/frappe_deploy.lock"
+          exec 9>"$LOCK_FILE"
+          
+          if ! flock -n 9; then
+            echo "❌ Another deployment is already running"
+            echo "Lock file: $LOCK_FILE"
             exit 1
+          fi
+          
+          echo "✅ Deployment lock acquired"
+
+          # Cleanup function
+          cleanup() {
+            local exit_code=$?
+            echo ""
+            echo "🧹 Cleanup function triggered (exit code: $exit_code)"
+            
+            # Release lock
+            flock -u 9 2>/dev/null || true
+            
+            if [ $exit_code -ne 0 ]; then
+              echo "❌ Deployment failed with exit code: $exit_code"
+              echo "📋 Last 50 lines of log:"
+              tail -50 /home/ubuntu/deploy.log
+            fi
+            
+            exit $exit_code
           }
+          
+          trap cleanup EXIT INT TERM
 
           # --------------------------------------------------
-          # Retry helper
+          # Retry helper function
           # --------------------------------------------------
           retry() {
             local retries=$1
             local wait_time=$2
             shift 2
-            local cmd="$@"
+            local cmd="$*"
 
             for ((i=1; i<=retries; i++)); do
-              echo "▶️ Attempt $i/$retries: $cmd"
+              echo ""
+              echo "▶️  Attempt $i/$retries: $cmd"
+              
               if eval "$cmd"; then
+                echo "✅ Command succeeded"
                 return 0
               fi
 
-              echo "⚠️ Command failed."
+              local last_exit_code=$?
+              echo "⚠️  Command failed with exit code: $last_exit_code"
+              
               if [ "$i" -lt "$retries" ]; then
                 echo "⏳ Waiting $wait_time seconds before retry..."
                 sleep "$wait_time"
@@ -69,71 +125,249 @@ jobs:
           # --------------------------------------------------
           # Pull latest code
           # --------------------------------------------------
-          cd /home/ubuntu/frappe-bench-test/apps/culinary_order_management
+          echo ""
+          echo "📥 Pulling Latest Code"
+          echo "-----------------------------------"
+          
+          APP_DIR="/home/ubuntu/frappe-bench-test/apps/culinary_order_management"
+          
+          if [ ! -d "$APP_DIR" ]; then
+            echo "❌ ERROR: App directory not found: $APP_DIR"
+            exit 1
+          fi
+          
+          cd "$APP_DIR" || exit 1
+          echo "📂 Changed to: $(pwd)"
 
-          echo "📥 Fetching latest code..."
-          git fetch upstream
-          git checkout main
-          git pull upstream main
+          echo "🔍 Git status before pull:"
+          git status --short || true
+
+          echo ""
+          echo "📡 Fetching from upstream..."
+          if ! retry 3 10 "git fetch upstream"; then
+            echo "⚠️  Failed to fetch from upstream, trying origin..."
+            retry 3 10 "git fetch origin" || {
+              echo "❌ Failed to fetch from both upstream and origin"
+              exit 1
+            }
+          fi
+
+          echo ""
+          echo "🔀 Checking out main branch..."
+          git checkout main || {
+            echo "❌ Failed to checkout main branch"
+            exit 1
+          }
+
+          echo ""
+          echo "⬇️  Pulling latest changes..."
+          if git remote | grep -q "upstream"; then
+            git pull upstream main || {
+              echo "⚠️  Failed to pull from upstream, trying origin..."
+              git pull origin main || {
+                echo "❌ Failed to pull from both upstream and origin"
+                exit 1
+              }
+            }
+          else
+            git pull origin main || {
+              echo "❌ Failed to pull from origin"
+              exit 1
+            }
+          fi
+
+          echo "✅ Code updated successfully"
+          echo "📝 Latest commit:"
+          git log -1 --oneline
 
           # --------------------------------------------------
-          # Build & migrate (with retry)
+          # Build assets
           # --------------------------------------------------
-          cd /home/ubuntu/frappe-bench-test
+          echo ""
+          echo "🏗️  Building Assets"
+          echo "-----------------------------------"
+          
+          BENCH_DIR="/home/ubuntu/frappe-bench-test"
+          cd "$BENCH_DIR" || exit 1
+          echo "📂 Changed to: $(pwd)"
 
-          echo "🏗️  Building assets..."
-          retry 5 60 bench build --app culinary_order_management
+          # Check if bench command is available
+          if ! command -v bench &> /dev/null; then
+            echo "❌ ERROR: bench command not found"
+            echo "Trying to use bench from virtual environment..."
+            if [ -f "$BENCH_DIR/env/bin/bench" ]; then
+              export PATH="$BENCH_DIR/env/bin:$PATH"
+            else
+              echo "❌ Virtual environment not found"
+              exit 1
+            fi
+          fi
 
-          echo "🧬 Running migrations..."
-          retry 5 60 bench migrate
+          echo "🔨 Building app: culinary_order_management"
+          
+          # Build with retry and timeout
+          if ! retry 3 60 "timeout 10m bench build --app culinary_order_management"; then
+            echo "❌ Build failed after retries"
+            echo "📋 Checking for build errors..."
+            ls -la sites/assets/ 2>&1 || echo "Assets directory not accessible"
+            exit 1
+          fi
+          
+          echo "✅ Build completed successfully"
 
-          echo "🧹 Clearing cache..."
-          retry 3 30 bench --site all clear-cache
+          # --------------------------------------------------
+          # Run migrations
+          # --------------------------------------------------
+          echo ""
+          echo "🧬 Running Migrations"
+          echo "-----------------------------------"
+          
+          if ! retry 3 60 "timeout 10m bench --site all migrate"; then
+            echo "❌ Migration failed after retries"
+            echo "📋 Checking site status..."
+            bench --site all list-apps 2>&1 || echo "Failed to list apps"
+            exit 1
+          fi
+          
+          echo "✅ Migrations completed successfully"
+
+          # --------------------------------------------------
+          # Clear cache
+          # --------------------------------------------------
+          echo ""
+          echo "🧹 Clearing Cache"
+          echo "-----------------------------------"
+          
+          if ! retry 2 30 "bench --site all clear-cache"; then
+            echo "⚠️  Cache clearing failed, but continuing..."
+          else
+            echo "✅ Cache cleared successfully"
+          fi
 
           # --------------------------------------------------
           # Restart services
           # --------------------------------------------------
-          echo "🔁 Restarting Frappe services..."
-          bench restart
+          echo ""
+          echo "🔁 Restarting Frappe Services"
+          echo "-----------------------------------"
+          
+          echo "🛑 Stopping services..."
+          bench restart || {
+            echo "⚠️  bench restart failed, trying manual restart..."
+            sudo supervisorctl restart all || {
+              echo "❌ Failed to restart services"
+              exit 1
+            }
+          }
+
+          echo "⏳ Waiting for services to stabilize..."
+          sleep 10
 
           echo ""
-          echo "📊 Supervisor status:"
-          sudo supervisorctl status
-
-          echo "==================================="
-          echo "✅ Deployment completed successfully"
-          echo "==================================="
-          ) 2>&1 | tee /home/ubuntu/deploy.log
+          echo "📊 Supervisor Status:"
+          echo "-----------------------------------"
+          sudo supervisorctl status || {
+            echo "⚠️  Could not get supervisor status"
+          }
 
           # --------------------------------------------------
           # Health check
           # --------------------------------------------------
+          echo ""
+          echo "🏥 Health Check"
+          echo "-----------------------------------"
+          
           sleep 5
-          if sudo supervisorctl status | grep -q "BACKOFF\|FATAL"; then
-            echo "⚠️  Some services failed to start"
-            sudo supervisorctl status | grep "BACKOFF\|FATAL"
+          
+          # Check for failed services
+          if sudo supervisorctl status | grep -qE "BACKOFF|FATAL|EXITED"; then
+            echo "❌ Some services are not running properly:"
+            sudo supervisorctl status | grep -E "BACKOFF|FATAL|EXITED" || true
+            
+            echo ""
+            echo "📋 Checking logs for failed services..."
+            sudo tail -50 /var/log/supervisor/*.log 2>&1 || echo "Could not read supervisor logs"
+            
             exit 1
           fi
 
-          # --------------------------------------------------
-          # Upload deploy log to Slack
-          # --------------------------------------------------
-          curl -F file=@/home/ubuntu/deploy.log \
-            -F "initial_comment=📄 Frappe Deployment Log" \
-            -F channels=your-slack-channel-id \
-            -H "Authorization: Bearer $SLACK_TOKEN" \
-            https://slack.com/api/files.upload
+          # Check if all expected services are running
+          RUNNING_COUNT=$(sudo supervisorctl status | grep -c "RUNNING" || echo "0")
+          echo "✅ Services running: $RUNNING_COUNT"
+          
+          if [ "$RUNNING_COUNT" -lt 1 ]; then
+            echo "❌ No services are running!"
+            exit 1
+          fi
 
-    - name: Notify Slack on success
-      if: success()
-      run: |
-        curl -X POST -H 'Content-type: application/json' \
-        --data "{\"text\":\":white_check_mark: *Frappe Deploy SUCCESS* on *${{ github.ref_name }}*\"}" \
-        ${{ secrets.SLACK_WEBHOOK }}
+          echo ""
+          echo "==================================="
+          echo "✅ Deployment Completed Successfully"
+          echo "📅 Completed at: $(date)"
+          echo "==================================="
 
-    - name: Notify Slack on failure
-      if: failure()
+    - name: Upload deployment logs
+      if: always()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.CULLINAR_ERP_EC2_HOST }}
+        username: ubuntu
+        key: ${{ secrets.CULLINAR_ERP_EC2_SSH_KEY }}
+        script: |
+          if [ -f /home/ubuntu/deploy.log ]; then
+            echo "📄 Deployment log content:"
+            tail -100 /home/ubuntu/deploy.log
+          else
+            echo "⚠️  No deployment log found"
+          fi
+
+    - name: Send Slack notification with log
+      if: always()
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
       run: |
-        curl -X POST -H 'Content-type: application/json' \
-        --data "{\"text\":\":x: *Frappe Deploy FAILED* on *${{ github.ref_name }}*\"}" \
-        ${{ secrets.SLACK_WEBHOOK }}
+        if [ "${{ job.status }}" == "success" ]; then
+          STATUS_EMOJI=":white_check_mark:"
+          STATUS_TEXT="SUCCESS"
+          COLOR="good"
+        else
+          STATUS_EMOJI=":x:"
+          STATUS_TEXT="FAILED"
+          COLOR="danger"
+        fi
+        
+        COMMIT_MSG=$(git log -1 --pretty=format:"%s" | head -c 100)
+        COMMIT_SHA=$(git rev-parse --short HEAD)
+        
+        curl -X POST "$SLACK_WEBHOOK" \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"attachments\": [{
+              \"color\": \"$COLOR\",
+              \"title\": \"$STATUS_EMOJI Frappe Deployment $STATUS_TEXT\",
+              \"fields\": [
+                {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                {\"title\": \"Commit\", \"value\": \"$COMMIT_SHA\", \"short\": true},
+                {\"title\": \"Author\", \"value\": \"${{ github.actor }}\", \"short\": true},
+                {\"title\": \"Duration\", \"value\": \"Started at $(date)\", \"short\": true},
+                {\"title\": \"Message\", \"value\": \"$COMMIT_MSG\", \"short\": false}
+              ],
+              \"footer\": \"GitHub Actions\",
+              \"ts\": $(date +%s)
+            }]
+          }"
+
+    - name: Comment on PR (if applicable)
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const status = '${{ job.status }}';
+          const emoji = status === 'success' ? '✅' : '❌';
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `${emoji} **Deployment ${status}**\n\nBranch: \`${{ github.ref_name }}\`\nCommit: \`${{ github.sha }}\``
+          });
