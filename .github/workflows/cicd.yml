@@ -21,7 +21,7 @@ jobs:
         host: ${{ secrets.CULLINAR_ERP_EC2_HOST }}
         username: ubuntu
         key: ${{ secrets.CULLINAR_ERP_EC2_SSH_KEY }}
-        command_timeout: 30m
+        command_timeout: 45m
         envs: SLACK_TOKEN
         script: |
           (
@@ -41,7 +41,33 @@ jobs:
           }
 
           # --------------------------------------------------
-          # Go to app directory & pull latest code
+          # Retry helper
+          # --------------------------------------------------
+          retry() {
+            local retries=$1
+            local wait_time=$2
+            shift 2
+            local cmd="$@"
+
+            for ((i=1; i<=retries; i++)); do
+              echo "▶️ Attempt $i/$retries: $cmd"
+              if eval "$cmd"; then
+                return 0
+              fi
+
+              echo "⚠️ Command failed."
+              if [ "$i" -lt "$retries" ]; then
+                echo "⏳ Waiting $wait_time seconds before retry..."
+                sleep "$wait_time"
+              fi
+            done
+
+            echo "❌ Command failed after $retries attempts"
+            return 1
+          }
+
+          # --------------------------------------------------
+          # Pull latest code
           # --------------------------------------------------
           cd /home/ubuntu/frappe-bench-test/apps/culinary_order_management
 
@@ -51,18 +77,18 @@ jobs:
           git pull origin main
 
           # --------------------------------------------------
-          # Build & migrate
+          # Build & migrate (with retry)
           # --------------------------------------------------
           cd /home/ubuntu/frappe-bench-test
 
           echo "🏗️  Building assets..."
-          bench build --app culinary_order_management
+          retry 5 60 bench build --app culinary_order_management
 
           echo "🧬 Running migrations..."
-          bench migrate
+          retry 5 60 bench migrate
 
           echo "🧹 Clearing cache..."
-          bench --site all clear-cache
+          retry 3 30 bench --site all clear-cache
 
           # --------------------------------------------------
           # Restart services
