@@ -1,0 +1,38 @@
+[
+	{
+		"doctype": "Role",
+		"name": "Agreement Specialist",
+		"role_name": "Agreement Specialist",
+		"desk_access": 1,
+		"is_custom": 1
+	},
+	{
+		"doctype": "Role",
+		"name": "Invoice Specialist",
+		"role_name": "Invoice Specialist",
+		"desk_access": 1,
+		"is_custom": 1
+	},
+	{
+		"doctype": "Role",
+		"name": "Portal Operations Specialist",
+		"role_name": "Portal Operations Specialist",
+		"desk_access": 1,
+		"is_custom": 1
+	},
+	{
+		"doctype": "Role",
+		"name": "Payment Specialist",
+		"role_name": "Payment Specialist",
+		"desk_access": 1,
+		"is_custom": 1
+	},
+	{
+		"doctype": "Role",
+		"name": "Business Development Manager",
+		"role_name": "Business Development Manager",
+		"desk_access": 1,
+		"is_custom": 1
+	}
+]
+

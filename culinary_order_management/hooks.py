@@ -85,6 +85,24 @@ fixtures = [
 		"filters": [
 			["name", "in", ["Item-supplier_display"]]
 		]
+	},
+	{
+		"dt": "Role",
+		"filters": [
+			["name", "in", [
+				"Agreement Specialist",
+				"Invoice Specialist",
+				"Portal Operations Specialist",
+				"Payment Specialist",
+				"Business Development Manager"
+			]]
+		]
+	},
+	{
+		"dt": "Report",
+		"filters": [
+			["report_name", "=", "Role and Permissions Report"]
+		]
 	}
 	# Item ve Item Price fixture'ları kaldırıldı (migration duplicate hatası)
 ]
@@ -102,7 +120,10 @@ fixtures = [
 # ------------
 
 # before_install = "culinary_order_management.install.before_install"
-after_install = "culinary_order_management.culinary_order_management.setup.ensure_admin_company_permissions_clear"
+after_install = [
+	"culinary_order_management.culinary_order_management.setup.ensure_admin_company_permissions_clear",
+	"culinary_order_management.culinary_order_management.setup.setup_custom_roles_and_permissions",
+]
 
 # Uninstallation
 # ------------
@@ -182,7 +203,12 @@ scheduler_events = {
 # -------
 
 # before_tests = "culinary_order_management.install.before_tests"
-after_migrate = "culinary_order_management.culinary_order_management.setup.ensure_admin_company_permissions_clear"
+after_migrate = [
+	"culinary_order_management.culinary_order_management.setup.ensure_admin_company_permissions_clear",
+	# setup_custom_roles_and_permissions removed from after_migrate
+	# to preserve manual permission changes made via UI (Permission Manager)
+	# It only runs on after_install (first installation)
+]
 
 # Overriding Methods
 # ------------------------------
